@@ -28,6 +28,7 @@ from astropy.io import fits
 from astropy import units as u
 from astropy.time import Time
 from astropy.constants import c as C
+from astropy.coordinates import ICRS, LSRK, SkyCoord, EarthLocation
 
 import pyclassfiller
 from pyclassfiller import code
@@ -122,12 +123,25 @@ class DiscosScanConverter(object):
             
     def _load_metadata(self, section, polarization, index):
         with fits.open(self.subscans[index][0]) as subscan:
-            self.location = (subscan[0].header["SiteLongitude"] * u.rad,
-                        subscan[0].header["SiteLatitude"] * u.rad)
-            self.location = (self.location[0].to(u.deg),
-                             self.location[1].to(u.deg))
+            self.location = (subscan[0].header["SiteLongitude"] * u.rad,subscan[0].header["SiteLatitude"] * u.rad)
+            self.longitude = self.location[0].to(u.deg) #KR
+            self.latitude = self.location[1].to(u.deg) #KR
+            self.location = (self.location[0].to(u.deg),self.location[1].to(u.deg))
             self.ra = subscan[0].header["RightAscension"]
             self.dec = subscan[0].header["Declination"]
+            self.ra_ha = (subscan[0].header["RightAscension"]*u.rad).to(u.hourangle) #KR
+            self.dec_deg = (subscan[0].header["Declination"] *u.rad).to(u.deg) #KR
+            self.height = subscan[0].header["SiteHeight"]*u.m #KR
+            self.time_obs = subscan[0].header["DATE"] #KR
+            self.lsrk_time = Time(self.time_obs) #KR
+            self.obsloc = EarthLocation.from_geodetic(self.longitude, self.latitude, self.height) #KR
+            self.sourcecoord = SkyCoord(self.ra_ha, self.dec_deg,unit=(u.hourangle, u.deg)) #KR
+            v_bary = self.sourcecoord.radial_velocity_correction(kind='barycentric', obstime=self.lsrk_time, location=self.obsloc) #KR
+            icrs = ICRS(self.sourcecoord.ra, self.sourcecoord.dec, pm_ra_cosdec=0*u.mas/u.yr, pm_dec=0*u.mas/u.yr, radial_velocity=v_bary, distance=1*u.pc) #KR
+            self.barycorr = icrs.transform_to(LSRK()).radial_velocity #KR
+            self.vrad_def = subscan[0].header["VLSR"] #in km/s KR
+            self.beta = - (self.vrad_def - (self.barycorr).to("km / s").value) / CLIGHT #KR
+
             self.observation_time = Time(subscan["DATA TABLE"].data["time"][0],
                                          format = "mjd",
                                          scale = "utc", 
@@ -262,7 +276,11 @@ class DiscosScanConverter(object):
                 logger.debug("offset at 0  %f" %  self.offsetFrequencyAt0)
 
                 obs.head.spe.vres = - (self.freq_resolution / self.central_frequency) * CLIGHT # frequency resolution must have the same unity like the central_frequency
-                obs.head.spe.voff = self.summary["velocity"]["vrad"]
+                self.drc = ((self.central_frequency - 1* self.freq_resolution)/(self.rest_frequency))     #KR          
+                self.dr2c = ((self.central_frequency - 1* self.freq_resolution)/(self.rest_frequency))**2 #KR
+                obs.head.spe.voff =  CLIGHT * (1-self.drc) + self.barycorr.to("km / s").value
+                #self.summary["velocity"]["vrad"] #KR - radio convention
+		#obs.head.spe.voff = self.summary["velocity"]["vrad"] KR COMMENTED
                 obs.head.spe.bad = 0.
                 obs.head.spe.image = 0.
                 if self.summary["velocity"]["vframe"] == "BARY":
@@ -278,10 +296,15 @@ class DiscosScanConverter(object):
                 else:
                     obs.head.spe.vtype = code.velo.unk
                     logger.debug("velocity: UNK")
-                v_observer = -((self.central_frequency - self.rest_frequency) /
-                                          self.rest_frequency) * CLIGHT
-                obs.head.spe.doppler = -  (v_observer + obs.head.spe.voff) / CLIGHT #doppler in units of c light
-                                        #the negative sign is a class convention. 
+
+
+                v_observer = obs.head.spe.voff - (self.barycorr).to("km / s").value #KR
+                obs.head.spe. doppler = -  (v_observer) / CLIGHT   #KR
+                #KR commented the lines below
+                #v_observer = -((self.central_frequency - self.rest_frequency) /
+                #                          self.rest_frequency) * CLIGHT
+                #obs.head.spe.doppler = -  (v_observer + obs.head.spe.voff) / CLIGHT #doppler in units of c light
+                #                        #the negative sign is a class convention.
                 logger.debug("Doppler  %f" %  obs.head.spe.doppler)
                 obs.head.spe.line = "SEC%d-%s" % (sec_id, pol)
                 on, off, cal = onoffcal[sec_id][pol]
@@ -296,11 +319,11 @@ class DiscosScanConverter(object):
                     tsys = counts2kelvin * off_mean
                     obs.head.gen.tsys = tsys
                     logger.debug("tsys: %f" % (tsys,))
-                    obs.datay = ((on - off) / off ) * tsys
+                    obs.datay = np.float32(((on - off) / off ) * tsys) #Elia
                 else:
                     logger.debug("skip calibration")
                     obs.head.gen.tsys = 1. # ANTENNA TEMP TABLE is unknown
-                    obs.datay = (on - off) / off
+                    obs.datay =  np.float32((on - off) / off) #Elia
                 obs.write()
                 self.file_class_out.close()
 
